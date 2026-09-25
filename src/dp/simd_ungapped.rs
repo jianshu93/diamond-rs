@@ -60,6 +60,24 @@ fn window_ungapped_into(
     score_matrix: &ScoreMatrix,
     out: &mut [i32],
 ) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mut offset = 0usize;
+        while offset < subjects.len() {
+            let end = (offset + 16).min(subjects.len());
+            unsafe {
+                window_ungapped_neon(
+                    query,
+                    &subjects[offset..end],
+                    window,
+                    score_matrix,
+                    &mut out[offset..end],
+                );
+            }
+            offset = end;
+        }
+        return;
+    }
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
@@ -97,8 +115,53 @@ fn window_ungapped_into(
             return;
         }
     }
-    for (i, subject) in subjects.iter().enumerate() {
-        out[i] = super::ungapped::ungapped_window(query, subject, window, score_matrix);
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        for (i, subject) in subjects.iter().enumerate() {
+            out[i] = super::ungapped::ungapped_window(query, subject, window, score_matrix);
+        }
+    }
+}
+
+/// AArch64 NEON implementation of multi-subject ungapped scoring.
+///
+/// Processes 16 subjects with the same shifted saturating i8 recurrence as
+/// the SSE4.1 path and the C++ DIAMOND kernel.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn window_ungapped_neon(
+    query: &[Letter],
+    subjects: &[&[Letter]],
+    window: usize,
+    score_matrix: &ScoreMatrix,
+    out: &mut [i32],
+) {
+    use std::arch::aarch64::*;
+
+    let subject_count = subjects.len().min(16);
+    let matrix8 = score_matrix.matrix8();
+    let mut score = vdupq_n_s8(i8::MIN);
+    let mut best = score;
+
+    for pos in 0..window.min(query.len()) {
+        let ql = (query[pos] & LETTER_MASK) as usize;
+        let row_offset = ql * 32;
+        let mut scores = [0i8; 16];
+        for (i, subject) in subjects[..subject_count].iter().enumerate() {
+            if pos < subject.len() {
+                let sl = (subject[pos] & LETTER_MASK) as usize;
+                scores[16 - subject_count + i] = matrix8[row_offset + sl];
+            }
+        }
+        score = vqaddq_s8(score, vld1q_s8(scores.as_ptr()));
+        best = vmaxq_s8(best, score);
+    }
+
+    let mut lanes = [0i8; 16];
+    vst1q_s8(lanes.as_mut_ptr(), best);
+    let offset = 16 - subject_count;
+    for i in 0..subject_count {
+        out[i] = lanes[offset + i] as i32 - i8::MIN as i32;
     }
 }
 
@@ -287,6 +350,23 @@ mod tests {
         );
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_neon_matches_scalar_for_full_batch() {
+        let sm = make_test_matrix();
+        let query: Vec<Letter> = (0..24).map(|i| (i % 20) as Letter).collect();
+        let subject_data: Vec<Vec<Letter>> = (0..16)
+            .map(|shift| (0..24).map(|i| ((i + shift * 3) % 20) as Letter).collect())
+            .collect();
+        let subjects = subject_data.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let expected = subjects
+            .iter()
+            .map(|subject| super::super::ungapped::ungapped_window(&query, subject, 24, &sm))
+            .collect::<Vec<_>>();
+
+        assert_eq!(window_ungapped(&query, &subjects, 24, &sm), expected);
+    }
+
     #[test]
     fn test_window_ungapped_best_uses_scalar_for_small_batches() {
         let sm = make_test_matrix();
@@ -306,12 +386,25 @@ mod tests {
         let subjects_data = [vec![17; 40], vec![17; 40], vec![17; 40], vec![17; 40]];
         let subjects: Vec<&[Letter]> = subjects_data.iter().map(|s| s.as_slice()).collect();
         let scores = window_ungapped(&query, &subjects, 40, &sm);
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert_eq!(scores, vec![255; 4]);
+            return;
+        }
         #[cfg(target_arch = "x86_64")]
         if is_x86_feature_detected!("sse4.1") {
             assert_eq!(scores, vec![255; 4]);
             return;
         }
-        let scalar = super::super::ungapped::ungapped_window(&query, subjects[0], 40, &sm);
-        assert_eq!(scores, vec![scalar; 4]);
+        #[cfg(target_arch = "x86_64")]
+        {
+            let scalar = super::super::ungapped::ungapped_window(&query, subjects[0], 40, &sm);
+            assert_eq!(scores, vec![scalar; 4]);
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            let scalar = super::super::ungapped::ungapped_window(&query, subjects[0], 40, &sm);
+            assert_eq!(scores, vec![scalar; 4]);
+        }
     }
 }

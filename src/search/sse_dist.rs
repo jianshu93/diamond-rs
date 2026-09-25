@@ -17,7 +17,48 @@ pub fn reduce_seq(seq: &[Letter], map: &[Letter]) -> [Letter; 16] {
 
 /// Matches C++ `match_block_reduced(const Letter*, const Letter*, const Reduction&)`.
 pub fn match_block_reduced(x: &[Letter], y: &[Letter], reduction: &Reduction) -> u32 {
+    #[cfg(target_arch = "aarch64")]
+    if x.len() >= 16 && y.len() >= 16 {
+        return unsafe { match_block_reduced_neon(x, y, reduction) };
+    }
     match_block_reduced_partial(x, y, 16, reduction)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn match_block_reduced_neon(x: &[Letter], y: &[Letter], reduction: &Reduction) -> u32 {
+    use std::arch::aarch64::*;
+
+    let mask = vdupq_n_u8(31);
+    let vx = vandq_u8(vld1q_u8(x.as_ptr().cast()), mask);
+    let vy = vandq_u8(vld1q_u8(y.as_ptr().cast()), mask);
+    let map = reduction.map8();
+    let table_lo = vld1q_u8(map.as_ptr().cast());
+    let table_hi = vld1q_u8(map.as_ptr().add(16).cast());
+    let sixteen = vdupq_n_u8(16);
+    let reduce = |letters: uint8x16_t| {
+        let low = vqtbl1q_u8(table_lo, letters);
+        let high = vqtbl1q_u8(table_hi, vsubq_u8(letters, sixteen));
+        vbslq_u8(vcltq_u8(letters, sixteen), low, high)
+    };
+    let valid = |letters: uint8x16_t| {
+        vandq_u8(
+            vandq_u8(
+                vmvnq_u8(vceqq_u8(letters, vdupq_n_u8(23))),
+                vmvnq_u8(vceqq_u8(letters, vdupq_n_u8(24))),
+            ),
+            vmvnq_u8(vceqq_u8(letters, vdupq_n_u8(31))),
+        )
+    };
+    let matches = vandq_u8(
+        vceqq_u8(reduce(vx), reduce(vy)),
+        vandq_u8(valid(vx), valid(vy)),
+    );
+    let mut lanes = [0u8; 16];
+    vst1q_u8(lanes.as_mut_ptr(), matches);
+    lanes.iter().enumerate().fold(0u32, |bits, (lane, &value)| {
+        bits | (((value >> 7) as u32) << lane)
+    })
 }
 
 fn match_block_reduced_partial(x: &[Letter], y: &[Letter], n: usize, reduction: &Reduction) -> u32 {
@@ -146,5 +187,22 @@ mod tests {
         masked[2] = SEED_MASK;
         masked[9] = SEED_MASK | 1;
         assert_eq!(seed_mask(&masked, 12), (1 << 2) | (1 << 9));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_neon_reduced_match_matches_scalar() {
+        let reduction = Reduction::default_reduction();
+        for offset in 0..32u8 {
+            let x = (0..16)
+                .map(|i| ((i * 7 + offset as usize) % 32) as Letter)
+                .collect::<Vec<_>>();
+            let mut y = x.clone();
+            y[offset as usize % 16] = ((offset as usize + 11) % 32) as Letter;
+            assert_eq!(
+                unsafe { match_block_reduced_neon(&x, &y, &reduction) },
+                match_block_reduced_partial(&x, &y, 16, &reduction)
+            );
+        }
     }
 }
