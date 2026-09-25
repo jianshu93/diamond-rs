@@ -21,6 +21,19 @@ pub fn has_avx2_fma() -> bool {
     false
 }
 
+pub fn has_simd() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        return has_avx2_fma();
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return true;
+    }
+    #[allow(unreachable_code)]
+    false
+}
+
 /// AVX2 horizontal sum: matches C++ hsum(__m256 a) exactly.
 ///   1. Split into two 128-bit halves, add them
 ///   2. Two horizontal adds
@@ -143,4 +156,212 @@ pub unsafe fn sum_avx2(f: &[f32; 50]) -> f32 {
         acc = _mm256_add_ps(acc, _mm256_loadu_ps(f.as_ptr().add(off)));
     }
     hsum_avx2(acc) + f[48] + f[49]
+}
+
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn forward_step_simd(
+    f: &mut [f32; 50],
+    d: &[f32; 50],
+    e_seg: &[f32],
+    b: &mut f32,
+    f2f: f32,
+    p_repeat_end: f32,
+    b2b: f32,
+    f_sum_prev: f32,
+) -> f32 {
+    forward_step_avx2(f, d, e_seg, b, f2f, p_repeat_end, b2b, f_sum_prev)
+}
+
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn backward_step_simd(
+    f: &mut [f32; 50],
+    d: &[f32; 50],
+    e_seg: &[f32],
+    b: &mut f32,
+    f2f: f32,
+    p_repeat_end: f32,
+    b2b: f32,
+) {
+    backward_step_avx2(f, d, e_seg, b, f2f, p_repeat_end, b2b)
+}
+
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn scale_simd(f: &mut [f32; 50], s: f32) {
+    scale_avx2(f, s)
+}
+
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn sum_simd(f: &[f32; 50]) -> f32 {
+    sum_avx2(f)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+pub unsafe fn forward_step_simd(
+    f: &mut [f32; 50],
+    d: &[f32; 50],
+    e_seg: &[f32],
+    b: &mut f32,
+    f2f: f32,
+    p_repeat_end: f32,
+    b2b: f32,
+    f_sum_prev: f32,
+) -> f32 {
+    use std::arch::aarch64::*;
+
+    let b_old = *b;
+    let vf2f = vdupq_n_f32(f2f);
+    let vb_old = vdupq_n_f32(b_old);
+    let mut total = 0.0f32;
+    for off in (0..48).step_by(4) {
+        let vf = vld1q_f32(f.as_ptr().add(off));
+        let vd = vld1q_f32(d.as_ptr().add(off));
+        let ve = vld1q_f32(e_seg.as_ptr().add(off));
+        let tmp = vaddq_f32(vmulq_f32(vf, vf2f), vmulq_f32(vb_old, vd));
+        let next = vmulq_f32(tmp, ve);
+        vst1q_f32(f.as_mut_ptr().add(off), next);
+        let mut lanes = [0.0f32; 4];
+        vst1q_f32(lanes.as_mut_ptr(), next);
+        total += lanes[0];
+        total += lanes[1];
+        total += lanes[2];
+        total += lanes[3];
+    }
+    for off in 48..50 {
+        f[off] = (f[off] * f2f + b_old * d[off]) * e_seg[off];
+        total += f[off];
+    }
+    *b = b_old * b2b + f_sum_prev * p_repeat_end;
+    total
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+pub unsafe fn backward_step_simd(
+    f: &mut [f32; 50],
+    d: &[f32; 50],
+    e_seg: &[f32],
+    b: &mut f32,
+    f2f: f32,
+    p_repeat_end: f32,
+    b2b: f32,
+) {
+    use std::arch::aarch64::*;
+
+    let vf2f = vdupq_n_f32(f2f);
+    let vc = vdupq_n_f32(p_repeat_end * *b);
+    let mut total = 0.0f32;
+    for off in (0..48).step_by(4) {
+        let vf = vld1q_f32(f.as_ptr().add(off));
+        let ve = vld1q_f32(e_seg.as_ptr().add(off));
+        let vd = vld1q_f32(d.as_ptr().add(off));
+        let vf_e = vmulq_f32(vf, ve);
+        let weighted = vmulq_f32(vf_e, vd);
+        let mut lanes = [0.0f32; 4];
+        vst1q_f32(lanes.as_mut_ptr(), weighted);
+        total += lanes[0];
+        total += lanes[1];
+        total += lanes[2];
+        total += lanes[3];
+        let next = vaddq_f32(vmulq_f32(vf_e, vf2f), vc);
+        vst1q_f32(f.as_mut_ptr().add(off), next);
+    }
+    for off in 48..50 {
+        let vf = f[off] * e_seg[off];
+        total += vf * d[off];
+        f[off] = vf * f2f + p_repeat_end * *b;
+    }
+    *b = b2b * *b + total;
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+pub unsafe fn scale_simd(f: &mut [f32; 50], s: f32) {
+    use std::arch::aarch64::*;
+
+    let scale = vdupq_n_f32(s);
+    for off in (0..48).step_by(4) {
+        let values = vld1q_f32(f.as_ptr().add(off));
+        vst1q_f32(f.as_mut_ptr().add(off), vmulq_f32(values, scale));
+    }
+    f[48] *= s;
+    f[49] *= s;
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+pub unsafe fn sum_simd(f: &[f32; 50]) -> f32 {
+    use std::arch::aarch64::*;
+
+    let mut total = 0.0f32;
+    for off in (0..48).step_by(4) {
+        let values = vld1q_f32(f.as_ptr().add(off));
+        let mut lanes = [0.0f32; 4];
+        vst1q_f32(lanes.as_mut_ptr(), values);
+        total += lanes[0];
+        total += lanes[1];
+        total += lanes[2];
+        total += lanes[3];
+    }
+    total + f[48] + f[49]
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod neon_tests {
+    use super::*;
+
+    fn inputs() -> ([f32; 50], [f32; 50], [f32; 50]) {
+        let mut f = [0.0; 50];
+        let mut d = [0.0; 50];
+        let mut e = [0.0; 50];
+        for i in 0..50 {
+            f[i] = (i as f32 + 1.0) / 97.0;
+            d[i] = (50 - i) as f32 / 193.0;
+            e[i] = (i % 11 + 3) as f32 / 17.0;
+        }
+        (f, d, e)
+    }
+
+    #[test]
+    fn neon_forward_backward_scale_and_sum_match_scalar() {
+        let (mut f, d, e) = inputs();
+        let mut expected = f;
+        let mut b = 0.73f32;
+        let mut expected_b = b;
+        let f2f = 0.91f32;
+        let repeat_end = 0.08f32;
+        let b2b = 0.87f32;
+        let previous_sum = 1.13f32;
+        let old_b = expected_b;
+        let mut expected_sum = 0.0;
+        for i in 0..50 {
+            expected[i] = (expected[i] * f2f + old_b * d[i]) * e[i];
+            expected_sum += expected[i];
+        }
+        expected_b = old_b * b2b + previous_sum * repeat_end;
+        let sum = unsafe {
+            forward_step_simd(&mut f, &d, &e, &mut b, f2f, repeat_end, b2b, previous_sum)
+        };
+        assert_eq!(f, expected);
+        assert_eq!(b, expected_b);
+        assert_eq!(sum, expected_sum);
+
+        let old_b = b;
+        let mut expected_total = 0.0;
+        for i in 0..50 {
+            let value = expected[i] * e[i];
+            expected_total += value * d[i];
+            expected[i] = value * f2f + repeat_end * old_b;
+        }
+        expected_b = b2b * old_b + expected_total;
+        unsafe { backward_step_simd(&mut f, &d, &e, &mut b, f2f, repeat_end, b2b) };
+        assert_eq!(f, expected);
+        assert_eq!(b, expected_b);
+
+        let factor = 1.37f32;
+        expected.iter_mut().for_each(|value| *value *= factor);
+        unsafe { scale_simd(&mut f, factor) };
+        assert_eq!(f, expected);
+        assert_eq!(unsafe { sum_simd(&f) }, f.iter().sum::<f32>());
+    }
 }

@@ -21,6 +21,19 @@ pub fn simd_banded_score(
     band_width: i32,
     score_matrix: &ScoreMatrix,
 ) -> SimdBandedResult {
+    #[cfg(target_arch = "aarch64")]
+    if band_width >= 0 {
+        return unsafe {
+            simd_banded_neon_i32(
+                query,
+                subject,
+                query_anchor,
+                subject_anchor,
+                band_width,
+                score_matrix,
+            )
+        };
+    }
     #[cfg(target_arch = "x86_64")]
     {
         if band_width >= 0 && is_x86_feature_detected!("sse4.1") {
@@ -48,6 +61,115 @@ pub fn simd_banded_score(
     SimdBandedResult {
         score: result.score,
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn simd_banded_neon_i32(
+    query: &[Letter],
+    subject: &[Letter],
+    query_anchor: i32,
+    subject_anchor: i32,
+    band_width: i32,
+    score_matrix: &ScoreMatrix,
+) -> SimdBandedResult {
+    use std::arch::aarch64::*;
+
+    let qlen = query.len() as i32;
+    let slen = subject.len() as i32;
+    if qlen == 0 || slen == 0 {
+        return SimdBandedResult::default();
+    }
+
+    let gap_open = score_matrix.gap_open() + score_matrix.gap_extend();
+    let gap_extend = score_matrix.gap_extend();
+    let neg_inf = i32::MIN / 4;
+    let diag = query_anchor - subject_anchor;
+    let rows = qlen as usize + 1;
+    let cols = slen as usize + 1;
+    let matrix32 = score_matrix.matrix32();
+    let idx = |i: usize, j: usize| -> usize { j * rows + i };
+    let in_band = |i: i32, d: i32| -> bool { (2 * i - d - diag).abs() <= band_width };
+
+    let mut h = vec![0i32; rows * cols];
+    let mut e = vec![neg_inf; rows * cols];
+    let mut f = vec![neg_inf; rows * cols];
+    let mut best_score = 0i32;
+    let v_gap_open = vdupq_n_s32(gap_open);
+    let v_gap_extend = vdupq_n_s32(gap_extend);
+    let v_zero = vdupq_n_s32(0);
+
+    for d in 2..=(qlen + slen) {
+        let mut i_start = 1.max(d - slen);
+        let mut i_end = qlen.min(d - 1);
+        while i_start <= i_end && !in_band(i_start, d) {
+            i_start += 1;
+        }
+        while i_end >= i_start && !in_band(i_end, d) {
+            i_end -= 1;
+        }
+        let mut i = i_start;
+        while i <= i_end {
+            let mut h_diag_arr = [0i32; 4];
+            let mut h_left_arr = [0i32; 4];
+            let mut e_left_arr = [neg_inf; 4];
+            let mut h_up_arr = [0i32; 4];
+            let mut f_up_arr = [neg_inf; 4];
+            let mut score_arr = [0i32; 4];
+            let mut current_idx = [0usize; 4];
+            let mut lane_count = 0usize;
+
+            for lane in 0..4 {
+                let ii = i + lane as i32;
+                if ii > i_end {
+                    break;
+                }
+                let jj = d - ii;
+                let iu = ii as usize;
+                let ju = jj as usize;
+                current_idx[lane] = idx(iu, ju);
+                h_diag_arr[lane] = h[idx(iu - 1, ju - 1)];
+                h_left_arr[lane] = h[idx(iu, ju - 1)];
+                e_left_arr[lane] = e[idx(iu, ju - 1)];
+                h_up_arr[lane] = h[idx(iu - 1, ju)];
+                f_up_arr[lane] = f[idx(iu - 1, ju)];
+                let ql = (query[iu - 1] & LETTER_MASK) as usize;
+                let sl = (subject[ju - 1] & LETTER_MASK) as usize;
+                score_arr[lane] = matrix32[ql * 32 + sl];
+                lane_count += 1;
+            }
+
+            let diag_score = vaddq_s32(
+                vld1q_s32(h_diag_arr.as_ptr()),
+                vld1q_s32(score_arr.as_ptr()),
+            );
+            let e_v = vmaxq_s32(
+                vsubq_s32(vld1q_s32(h_left_arr.as_ptr()), v_gap_open),
+                vsubq_s32(vld1q_s32(e_left_arr.as_ptr()), v_gap_extend),
+            );
+            let f_v = vmaxq_s32(
+                vsubq_s32(vld1q_s32(h_up_arr.as_ptr()), v_gap_open),
+                vsubq_s32(vld1q_s32(f_up_arr.as_ptr()), v_gap_extend),
+            );
+            let h_v = vmaxq_s32(vmaxq_s32(diag_score, e_v), vmaxq_s32(f_v, v_zero));
+            let mut e_out = [0i32; 4];
+            let mut f_out = [0i32; 4];
+            let mut h_out = [0i32; 4];
+            vst1q_s32(e_out.as_mut_ptr(), e_v);
+            vst1q_s32(f_out.as_mut_ptr(), f_v);
+            vst1q_s32(h_out.as_mut_ptr(), h_v);
+
+            for lane in 0..lane_count {
+                let current = current_idx[lane];
+                e[current] = e_out[lane];
+                f[current] = f_out[lane];
+                h[current] = h_out[lane];
+                best_score = best_score.max(h_out[lane]);
+            }
+            i += 4;
+        }
+    }
+    SimdBandedResult { score: best_score }
 }
 
 #[cfg(target_arch = "x86_64")]

@@ -297,9 +297,9 @@ fn mask_tantan_inner(seq: &mut [Letter], lr_matrix: &[Vec<f32>], min_mask_prob: 
         e.push(ev);
     }
 
-    // Forward-backward HMM with runtime SIMD dispatch. The AVX2 path avoids FMA
-    // to match DIAMOND's AVX2 build and keep rounding parity with C++.
-    let use_simd = super::tantan_simd::has_avx2_fma();
+    // Forward-backward HMM with runtime SIMD dispatch. SIMD paths avoid FMA to
+    // match DIAMOND's AVX2 build and keep rounding parity with C++.
+    let use_simd = super::tantan_simd::has_simd();
 
     let mut f = [0.0f32; WINDOW];
     let mut d_arr = [0.0f32; WINDOW];
@@ -314,11 +314,10 @@ fn mask_tantan_inner(seq: &mut [Letter], lr_matrix: &[Vec<f32>], min_mask_prob: 
         let ltr = (seq[i] & LETTER_MASK) as usize;
         let e_seg = &e[ltr][len - i..];
 
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         if use_simd {
-            // SAFETY: has_avx2_fma() confirmed AVX2+FMA support
             f_sum = unsafe {
-                super::tantan_simd::forward_step_avx2(
+                super::tantan_simd::forward_step_simd(
                     &mut f,
                     &d_arr,
                     e_seg,
@@ -342,7 +341,7 @@ fn mask_tantan_inner(seq: &mut [Letter], lr_matrix: &[Vec<f32>], min_mask_prob: 
                 &mut f_sum,
             );
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         forward_step_scalar(
             &mut f,
             &d_arr,
@@ -360,17 +359,17 @@ fn mask_tantan_inner(seq: &mut [Letter], lr_matrix: &[Vec<f32>], min_mask_prob: 
             let s = 1.0 / b;
             scale[i / 16] = s;
             b *= s;
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             if use_simd {
                 unsafe {
-                    super::tantan_simd::scale_avx2(&mut f, s);
+                    super::tantan_simd::scale_simd(&mut f, s);
                 }
             } else {
                 for v in f.iter_mut() {
                     *v *= s;
                 }
             }
-            #[cfg(not(target_arch = "x86_64"))]
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
             for v in f.iter_mut() {
                 *v *= s;
             }
@@ -381,13 +380,13 @@ fn mask_tantan_inner(seq: &mut [Letter], lr_matrix: &[Vec<f32>], min_mask_prob: 
 
     // Terminal probability
     let f_total = {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         if use_simd {
-            unsafe { super::tantan_simd::sum_avx2(&f) }
+            unsafe { super::tantan_simd::sum_simd(&f) }
         } else {
             f.iter().sum::<f32>()
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             f.iter().sum::<f32>()
         }
@@ -406,17 +405,17 @@ fn mask_tantan_inner(seq: &mut [Letter], lr_matrix: &[Vec<f32>], min_mask_prob: 
         if (i & 15) == 15 {
             let s = scale[i / 16];
             b *= s;
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             if use_simd {
                 unsafe {
-                    super::tantan_simd::scale_avx2(&mut f, s);
+                    super::tantan_simd::scale_simd(&mut f, s);
                 }
             } else {
                 for v in f.iter_mut() {
                     *v *= s;
                 }
             }
-            #[cfg(not(target_arch = "x86_64"))]
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
             for v in f.iter_mut() {
                 *v *= s;
             }
@@ -425,10 +424,10 @@ fn mask_tantan_inner(seq: &mut [Letter], lr_matrix: &[Vec<f32>], min_mask_prob: 
         let ltr = (seq[i] & LETTER_MASK) as usize;
         let e_seg = &e[ltr][len - i..];
 
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         if use_simd {
             unsafe {
-                super::tantan_simd::backward_step_avx2(
+                super::tantan_simd::backward_step_simd(
                     &mut f,
                     &d_arr,
                     e_seg,
@@ -441,7 +440,7 @@ fn mask_tantan_inner(seq: &mut [Letter], lr_matrix: &[Vec<f32>], min_mask_prob: 
         } else {
             backward_step_scalar(&mut f, &d_arr, e_seg, &mut b, f2f, P_REPEAT_END, b2b);
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         backward_step_scalar(&mut f, &d_arr, e_seg, &mut b, f2f, P_REPEAT_END, b2b);
 
         if pf >= min_mask_prob {
