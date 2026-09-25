@@ -198,7 +198,8 @@ pub fn total_ram() -> f64 {
 
 #[cfg(not(windows))]
 unsafe extern "C" {
-    fn open(pathname: *const i8, flags: i32) -> i32;
+    #[link_name = "open"]
+    fn libc_open(pathname: *const i8, flags: i32, ...) -> i32;
     fn mmap(
         addr: *mut c_void,
         length: usize,
@@ -224,7 +225,7 @@ pub fn mmap_file(filename: &str) -> Result<(*mut u8, usize, i32), String> {
         const MAP_SHARED: i32 = 1;
         let c_filename =
             CString::new(filename).map_err(|_| format!("Error opening file: {filename}"))?;
-        let fd = unsafe { open(c_filename.as_ptr(), O_RDONLY) };
+        let fd = unsafe { libc_open(c_filename.as_ptr(), O_RDONLY) };
         if fd == -1 {
             return Err(format!("Error opening file: {filename}"));
         }

@@ -22,7 +22,7 @@ pub fn match_block_reduced(x: &[Letter], y: &[Letter], reduction: &Reduction) ->
 
 fn match_block_reduced_partial(x: &[Letter], y: &[Letter], n: usize, reduction: &Reduction) -> u32 {
     let mut r = 0u32;
-    for i in (0..n).rev() {
+    for i in (0..n.min(x.len()).min(y.len())).rev() {
         r <<= 1;
         let lx = letter_mask(x[i]);
         let ly = letter_mask(y[i]);
@@ -38,7 +38,7 @@ fn match_block_reduced_partial(x: &[Letter], y: &[Letter], n: usize, reduction: 
 
 /// Matches C++ `reduced_match32(const Letter*, const Letter*, unsigned, const Reduction&)`.
 pub fn reduced_match32(q: &[Letter], s: &[Letter], len: u32, reduction: &Reduction) -> u64 {
-    let len = len as usize;
+    let len = (len as usize).min(q.len()).min(s.len());
     let mut x = match_block_reduced_partial(q, s, len.min(16), reduction) as u64;
     if len > 16 {
         x |= (match_block_reduced_partial(&q[16..], &s[16..], (len - 16).min(16), reduction)
@@ -54,7 +54,7 @@ pub fn reduced_match32(q: &[Letter], s: &[Letter], len: u32, reduction: &Reducti
 /// Matches C++ `reduced_match(const Letter*, const Letter*, int, const Reduction&)`.
 pub fn reduced_match(q: &[Letter], s: &[Letter], len: i32, reduction: &Reduction) -> u64 {
     assert!(len <= 64);
-    let len = len as usize;
+    let len = (len as usize).min(q.len()).min(s.len());
     if len < 64 {
         let mask = (1u64 << len) - 1;
         let mut m = match_block_reduced_partial(q, s, len.min(16), reduction) as u64;
@@ -87,7 +87,7 @@ pub fn reduced_match(q: &[Letter], s: &[Letter], len: i32, reduction: &Reduction
 pub fn seed_mask(s: &[Letter], len: i32) -> u64 {
     assert!(len <= 64);
     let mut mask = 0u64;
-    for i in 0..len as usize {
+    for i in 0..(len as usize).min(s.len()) {
         if (s[i] & SEED_MASK) != 0 {
             mask |= 1u64 << i;
         }
@@ -117,6 +117,17 @@ mod tests {
         assert_eq!(mask & 1, 0);
         assert_eq!(mask & 2, 2);
         assert_eq!(mask & 4, 0);
+    }
+
+    #[test]
+    fn test_match_block_reduced_accepts_short_tail_blocks() {
+        let reduction = Reduction::default_reduction();
+        let x = [0, 1, 2, 3, 4, 5, 6];
+
+        assert_eq!(match_block_reduced(&x, &x, &reduction), 0x7f);
+        assert_eq!(reduced_match(&x, &x, 64, &reduction), 0x7f);
+        assert_eq!(reduced_match32(&x, &x, 32, &reduction), 0x7f);
+        assert_eq!(seed_mask(&x, 64), 0);
     }
 
     #[test]
