@@ -1,9 +1,12 @@
 use std::io::{self, BufWriter, Write};
 use std::ops::Range;
 use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{
+    IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
+};
 
 use crate::align::hsp::Match;
 use crate::align::target::{extend as extend_targets, GappedScoreConfig};
@@ -36,6 +39,93 @@ fn trim_freed_heap_pages() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     unsafe {
         let _ = malloc_trim(0);
+    }
+}
+
+type MaskRanges = Arc<Vec<Vec<(u32, u32)>>>;
+static TANTAN_CACHE: OnceLock<Mutex<std::collections::HashMap<String, MaskRanges>>> =
+    OnceLock::new();
+const TANTAN_CACHE_CAPACITY: usize = 128;
+
+fn append_file_identity(key: &mut String, path: &Path) {
+    key.push('|');
+    key.push_str(&path.to_string_lossy());
+    if let Ok(metadata) = std::fs::metadata(path) {
+        key.push(':');
+        key.push_str(&metadata.len().to_string());
+        if let Ok(modified) = metadata.modified() {
+            if let Ok(elapsed) = modified.duration_since(std::time::UNIX_EPOCH) {
+                key.push(':');
+                key.push_str(&elapsed.as_nanos().to_string());
+            }
+        }
+    }
+}
+
+fn masking_cache_key(paths: &[String], matrix: &str) -> String {
+    let mut key = matrix.to_owned();
+    for path in paths {
+        let path = Path::new(path);
+        if path.extension().is_none() {
+            let dmnd = path.with_extension("dmnd");
+            if dmnd.exists() {
+                append_file_identity(&mut key, &dmnd);
+                continue;
+            }
+        }
+        append_file_identity(&mut key, path);
+    }
+    key
+}
+
+fn apply_tantan_cached(
+    records: &mut [fasta::FastaRecord],
+    key: String,
+    masker: &crate::masking::tantan::TantanMasker,
+) {
+    use crate::basic::value::{MASK_LETTER, SEED_MASK};
+    use rayon::iter::IntoParallelRefMutIterator;
+
+    let cache = TANTAN_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let cached = cache.lock().ok().and_then(|cache| cache.get(&key).cloned());
+    if let Some(ranges) = cached.filter(|ranges| ranges.len() == records.len()) {
+        records
+            .par_iter_mut()
+            .zip(ranges.par_iter())
+            .for_each(|(record, ranges)| {
+                for &(begin, end) in ranges {
+                    record.sequence[begin as usize..end as usize].fill(MASK_LETTER);
+                }
+            });
+        return;
+    }
+
+    let ranges: Vec<Vec<(u32, u32)>> = records
+        .par_iter_mut()
+        .map(|record| {
+            crate::masking::remove_bit_mask(&mut record.sequence);
+            masker.mask(&mut record.sequence);
+            let mut ranges = Vec::new();
+            let mut begin = None;
+            for (index, letter) in record.sequence.iter_mut().enumerate() {
+                if *letter & SEED_MASK != 0 {
+                    begin.get_or_insert(index as u32);
+                    *letter = MASK_LETTER;
+                } else if let Some(begin) = begin.take() {
+                    ranges.push((begin, index as u32));
+                }
+            }
+            if let Some(begin) = begin {
+                ranges.push((begin, record.sequence.len() as u32));
+            }
+            ranges
+        })
+        .collect();
+    if let Ok(mut cache) = cache.lock() {
+        if cache.len() >= TANTAN_CACHE_CAPACITY {
+            cache.clear();
+        }
+        cache.insert(key, Arc::new(ranges));
     }
 }
 
@@ -163,7 +253,6 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
     }
     eprintln!("Queries: {} sequences", query_records.len());
 
-    use rayon::iter::IntoParallelRefMutIterator;
     match config.masking {
         MaskingMode::None => {}
         MaskingMode::Tantan => {
@@ -175,14 +264,16 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
             // low-complexity regions under-masked and inflates self scores.
             let tantan_masker =
                 crate::masking::tantan::TantanMasker::from_score_matrix(&score_matrix, 0.9);
-            db_records.par_iter_mut().for_each(|r| {
-                crate::masking::remove_bit_mask(&mut r.sequence);
-                tantan_masker.mask(&mut r.sequence);
-            });
-            query_records.par_iter_mut().for_each(|r| {
-                crate::masking::remove_bit_mask(&mut r.sequence);
-                tantan_masker.mask(&mut r.sequence);
-            });
+            apply_tantan_cached(
+                &mut db_records,
+                masking_cache_key(std::slice::from_ref(&config.database), &config.matrix),
+                &tantan_masker,
+            );
+            apply_tantan_cached(
+                &mut query_records,
+                masking_cache_key(&config.query_files, &config.matrix),
+                &tantan_masker,
+            );
         }
         MaskingMode::BlastSeg => {
             return Err(io::Error::new(
@@ -192,7 +283,7 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
         }
     }
 
-    // Convert tantan soft masks (SEED_MASK bit) to hard masks (MASK_LETTER = X).
+    // TANTAN cache application above already converts soft masks to hard masks.
     // C++ blastp calls `mask_seqs(..., hard_mask=true)` on both queries and
     // targets (run/double_indexed.cpp:127 and :719), which `Masking::operator()`
     // dispatches to `tantan::mask` in mode 1 — REPLACING masked letters with
@@ -204,22 +295,6 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
     // applying the -1 BLOSUM penalty — for a self-self of a heavily-masked
     // protein (Q8QZQ8: 120+ masked residues), that's 120+ extra score relative
     // to C++ and shifts which targets fit inside `-k 25`.
-    use crate::basic::value::{MASK_LETTER, SEED_MASK};
-    let hard_mask = |seq: &mut [Letter]| {
-        for l in seq.iter_mut() {
-            if *l & SEED_MASK != 0 {
-                *l = MASK_LETTER;
-            }
-        }
-    };
-    if config.masking == MaskingMode::Tantan {
-        db_records
-            .par_iter_mut()
-            .for_each(|r| hard_mask(&mut r.sequence));
-        query_records
-            .par_iter_mut()
-            .for_each(|r| hard_mask(&mut r.sequence));
-    }
 
     // Motif masking — ports C++ `Block::soft_mask(MOTIF)` invoked from
     // `enum_seeds` (enum_seeds.h:202). At default sensitivity DIAMOND

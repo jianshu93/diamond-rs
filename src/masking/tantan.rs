@@ -9,11 +9,34 @@
 
 use crate::basic::value::{Letter, AMINO_ACID_COUNT, LETTER_MASK, SEED_MASK, TRUE_AA};
 use crate::stats::score_matrix::ScoreMatrix;
+use std::cell::RefCell;
 
 /// Default tantan parameters matching C++ DIAMOND.
 const P_REPEAT: f32 = 0.005;
 const P_REPEAT_END: f32 = 0.05;
 const REPEAT_GROWTH: f32 = 1.0 / 0.9;
+
+struct TantanWorkspace {
+    emissions: Vec<Vec<f32>>,
+    posterior_background: Vec<f32>,
+    scales: Vec<f32>,
+}
+
+impl TantanWorkspace {
+    fn new() -> Self {
+        Self {
+            emissions: (0..(LETTER_MASK as usize + 1))
+                .map(|_| Vec::new())
+                .collect(),
+            posterior_background: Vec::new(),
+            scales: Vec::new(),
+        }
+    }
+}
+
+thread_local! {
+    static WORKSPACE: RefCell<TantanWorkspace> = RefCell::new(TantanWorkspace::new());
+}
 const DEFAULT_MIN_MASK_PROB: f32 = 0.9;
 const WINDOW: usize = 50;
 
@@ -253,6 +276,17 @@ fn backward_step_scalar(
 
 /// Core tantan implementation using a pre-computed likelihood ratio matrix.
 fn mask_tantan_inner(seq: &mut [Letter], lr_matrix: &[Vec<f32>], min_mask_prob: f32) {
+    WORKSPACE.with(|workspace| {
+        mask_tantan_inner_with_workspace(seq, lr_matrix, min_mask_prob, &mut workspace.borrow_mut())
+    });
+}
+
+fn mask_tantan_inner_with_workspace(
+    seq: &mut [Letter],
+    lr_matrix: &[Vec<f32>],
+    min_mask_prob: f32,
+    workspace: &mut TantanWorkspace,
+) {
     let len = seq.len();
     if len == 0 {
         return;
@@ -283,9 +317,15 @@ fn mask_tantan_inner(seq: &mut [Letter], lr_matrix: &[Vec<f32>], min_mask_prob: 
     // letters (B/J/Z/X/*/_, ids 20..25) DO contribute non-zero emissions via the
     // populated 26x26 lr_matrix block. Only DELIMITER (31) and similarly-stripped
     // values read past the 26-column initialized region (C++ UB, typically zero).
-    let mut e: Vec<Vec<f32>> = Vec::with_capacity(emission_rows);
+    let TantanWorkspace {
+        emissions: e,
+        posterior_background: pb,
+        scales: scale,
+    } = workspace;
     for aa in 0..emission_rows {
-        let mut ev = vec![0.0f32; len + WINDOW];
+        let ev = &mut e[aa];
+        ev.resize(len + WINDOW, 0.0);
+        ev.fill(0.0);
         if aa < alphabet_size {
             for j in 0..len {
                 let idx = (seq[j] & LETTER_MASK) as usize;
@@ -294,7 +334,6 @@ fn mask_tantan_inner(seq: &mut [Letter], lr_matrix: &[Vec<f32>], min_mask_prob: 
                 }
             }
         }
-        e.push(ev);
     }
 
     // Forward-backward HMM with runtime SIMD dispatch. SIMD paths avoid FMA to
@@ -304,8 +343,8 @@ fn mask_tantan_inner(seq: &mut [Letter], lr_matrix: &[Vec<f32>], min_mask_prob: 
     let mut f = [0.0f32; WINDOW];
     let mut d_arr = [0.0f32; WINDOW];
     d_arr.copy_from_slice(&d);
-    let mut pb = vec![0.0f32; len];
-    let mut scale = vec![0.0f32; (len + 15) / 16];
+    pb.resize(len, 0.0);
+    scale.resize((len + 15) / 16, 0.0);
     let mut b = 1.0f32;
     let mut f_sum = 0.0f32;
 

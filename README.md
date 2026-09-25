@@ -39,7 +39,7 @@ This project is an ongoing port of the DIAMOND C++ codebase to Rust. Currently:
 - **CLI**: `blastp` and `blastx` run natively in Rust by default; C++ FFI fallback is only built for non-Windows conformance testing with `--features ffi`
 - **Native Rust commands**: `blastp`, `blastx`, `makedb`, `dbinfo`, `getseq`, `version`, `help`
 - **Parallel**: Seed search uses rayon for multi-threaded processing
-- **SIMD**: SSE4.1/AVX2 vectorized ungapped scoring
+- **SIMD**: NEON, SSE, and AVX2 acceleration for search filtering, ungapped scoring, banded alignment, and TANTAN masking
 - **Library API**: Core types, scoring matrices, DP kernels, FASTA parsing, and seed search
 - **Tests**: 206 tests including all 20 C++ regression tests + native-vs-FFI equivalence
 - **Not yet translated**: SQLite-backed taxonomy lookup for NCBI BLAST databases (`taxonomy4blast.sqlite3`), used by taxonomy-aware output fields such as `slineages`, `sskingdoms`, `skingdoms`, and `sphylums`
@@ -161,7 +161,7 @@ src/
   basic/      - Core types: Letter, Sequence, Seed, Shape, Reduction
   stats/      - Scoring matrices (BLOSUM/PAM), E-value computation
   data/       - File formats: FASTA, DMND database, DAA archive
-  dp/         - Dynamic programming: ungapped x-drop, Smith-Waterman, banded DP, SIMD (SSE4.1/AVX2)
+  dp/         - Dynamic programming: ungapped x-drop, Smith-Waterman, banded DP, SIMD
   masking/    - Tantan repeat masking
   search/     - Seed extraction, hash join, hit buffer
   align/      - HSP, Match, target culling
@@ -173,9 +173,10 @@ src/
 
 ### SIMD Support
 
-The DP kernels use `std::arch` intrinsics with runtime detection:
-- **SSE4.1**: 16-way parallel ungapped scoring
-- **AVX2**: 32-way parallel ungapped scoring
+Performance-critical search and masking kernels use `std::arch` intrinsics with runtime detection:
+- **AArch64 NEON**: Hamming filtering, ungapped scoring, banded alignment, and TANTAN masking
+- **x86 SSE2/SSE4.1**: Hamming filtering, ungapped scoring, and TANTAN masking
+- **x86 AVX2**: Wider Hamming filtering, ungapped scoring, and TANTAN masking
 - **Scalar fallback**: Works on all platforms
 
 ## Citation

@@ -140,20 +140,31 @@ unsafe fn window_ungapped_neon(
 
     let subject_count = subjects.len().min(16);
     let matrix8 = score_matrix.matrix8();
+    let low_mask = vdupq_n_u8(15);
+    let sixteen = vdupq_n_u8(16);
     let mut score = vdupq_n_s8(i8::MIN);
     let mut best = score;
 
     for pos in 0..window.min(query.len()) {
         let ql = (query[pos] & LETTER_MASK) as usize;
         let row_offset = ql * 32;
-        let mut scores = [0i8; 16];
+        let mut letters = [0u8; 16];
         for (i, subject) in subjects[..subject_count].iter().enumerate() {
             if pos < subject.len() {
-                let sl = (subject[pos] & LETTER_MASK) as usize;
-                scores[16 - subject_count + i] = matrix8[row_offset + sl];
+                letters[16 - subject_count + i] = (subject[pos] & LETTER_MASK) as u8;
             }
         }
-        score = vqaddq_s8(score, vld1q_s8(scores.as_ptr()));
+        let indices = vld1q_u8(letters.as_ptr());
+        let lo = vqtbl1q_s8(
+            vld1q_s8(matrix8.as_ptr().add(row_offset)),
+            vandq_u8(indices, low_mask),
+        );
+        let hi = vqtbl1q_s8(
+            vld1q_s8(matrix8.as_ptr().add(row_offset + 16)),
+            vandq_u8(vsubq_u8(indices, sixteen), low_mask),
+        );
+        let match_scores = vbslq_s8(vcltq_u8(indices, sixteen), lo, hi);
+        score = vqaddq_s8(score, match_scores);
         best = vmaxq_s8(best, score);
     }
 
@@ -198,18 +209,17 @@ unsafe fn window_ungapped_sse41(
             }
         }
 
-        // Look up scores: for each subject letter, get score[query_letter][subject_letter]
-        // We need to use the matrix row for the query letter
         let row_offset = ql * 32;
-        let mut scores_arr = [0i8; 16];
-        for i in 0..16 {
-            let sl = subject_letters[i] as usize;
-            if sl < 32 {
-                scores_arr[i] = matrix8[row_offset + sl];
-            }
-        }
-
-        let match_scores = _mm_loadu_si128(scores_arr.as_ptr() as *const __m128i);
+        let indices = _mm_loadu_si128(subject_letters.as_ptr().cast());
+        let lo = _mm_shuffle_epi8(
+            _mm_loadu_si128(matrix8.as_ptr().add(row_offset).cast()),
+            indices,
+        );
+        let hi = _mm_shuffle_epi8(
+            _mm_loadu_si128(matrix8.as_ptr().add(row_offset + 16).cast()),
+            _mm_sub_epi8(indices, _mm_set1_epi8(16)),
+        );
+        let match_scores = _mm_blendv_epi8(lo, hi, _mm_cmpgt_epi8(indices, _mm_set1_epi8(15)));
 
         score = _mm_adds_epi8(score, match_scores);
         best = _mm_max_epi8(best, score);
@@ -251,17 +261,25 @@ unsafe fn window_ungapped_avx2(
         let ql = (query[pos] & LETTER_MASK) as usize;
         let row_offset = ql * 32;
 
-        let mut scores_arr = [0i8; 32];
+        let mut letters = [0i8; 32];
         for (i, subj) in subjects[..subject_count].iter().enumerate() {
             if pos < subj.len() {
-                let sl = (subj[pos] & LETTER_MASK) as usize;
-                if sl < 32 {
-                    scores_arr[32 - subject_count + i] = matrix8[row_offset + sl];
-                }
+                letters[32 - subject_count + i] = subj[pos] & LETTER_MASK;
             }
         }
-
-        let match_scores = _mm256_loadu_si256(scores_arr.as_ptr() as *const __m256i);
+        let indices = _mm256_loadu_si256(letters.as_ptr().cast());
+        let lo = _mm256_shuffle_epi8(
+            _mm256_broadcastsi128_si256(_mm_loadu_si128(matrix8.as_ptr().add(row_offset).cast())),
+            indices,
+        );
+        let hi = _mm256_shuffle_epi8(
+            _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                matrix8.as_ptr().add(row_offset + 16).cast(),
+            )),
+            _mm256_sub_epi8(indices, _mm256_set1_epi8(16)),
+        );
+        let match_scores =
+            _mm256_blendv_epi8(lo, hi, _mm256_cmpgt_epi8(indices, _mm256_set1_epi8(15)));
 
         score = _mm256_adds_epi8(score, match_scores);
         best = _mm256_max_epi8(best, score);

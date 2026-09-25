@@ -1,16 +1,11 @@
-//! AVX2 SIMD tantan forward/backward steps.
+//! SIMD TANTAN forward/backward steps for x86-64 and AArch64.
 //!
-//! Direct port of C++ `masking/tantan.cpp` SIMD path using Rust `std::arch::x86_64`.
-//! Processes 8 floats at a time matching the C++ AVX2 dispatch.
+//! Uses AVX2 or SSE2 on x86-64 and NEON on AArch64, selected at runtime.
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
-/// Check if AVX2 is available at runtime. Does NOT require FMA — the SIMD
-/// path is deliberately FMA-free to match C++'s AVX2 build (no `-mfma`), so
-/// gating on FMA would needlessly fall back to scalar on AVX2-only CPUs and
-/// (with a different rounding mode) drift parity. See `forward_step_avx2`
-/// for the no-FMA mul+add pattern.
+/// Check whether the AVX2 implementation is available at runtime.
 #[cfg(target_arch = "x86_64")]
 pub fn has_avx2_fma() -> bool {
     is_x86_feature_detected!("avx2")
@@ -24,7 +19,7 @@ pub fn has_avx2_fma() -> bool {
 pub fn has_simd() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
-        return has_avx2_fma();
+        return has_avx2_fma() || is_x86_feature_detected!("sse2");
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -169,7 +164,11 @@ pub unsafe fn forward_step_simd(
     b2b: f32,
     f_sum_prev: f32,
 ) -> f32 {
-    forward_step_avx2(f, d, e_seg, b, f2f, p_repeat_end, b2b, f_sum_prev)
+    if has_avx2_fma() {
+        forward_step_avx2(f, d, e_seg, b, f2f, p_repeat_end, b2b, f_sum_prev)
+    } else {
+        forward_step_sse2(f, d, e_seg, b, f2f, p_repeat_end, b2b, f_sum_prev)
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -182,17 +181,130 @@ pub unsafe fn backward_step_simd(
     p_repeat_end: f32,
     b2b: f32,
 ) {
-    backward_step_avx2(f, d, e_seg, b, f2f, p_repeat_end, b2b)
+    if has_avx2_fma() {
+        backward_step_avx2(f, d, e_seg, b, f2f, p_repeat_end, b2b)
+    } else {
+        backward_step_sse2(f, d, e_seg, b, f2f, p_repeat_end, b2b)
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn scale_simd(f: &mut [f32; 50], s: f32) {
-    scale_avx2(f, s)
+    if has_avx2_fma() {
+        scale_avx2(f, s)
+    } else {
+        scale_sse2(f, s)
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn sum_simd(f: &[f32; 50]) -> f32 {
-    sum_avx2(f)
+    if has_avx2_fma() {
+        sum_avx2(f)
+    } else {
+        sum_sse2(f)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn hsum_sse2(value: __m128) -> f32 {
+    let high = _mm_movehl_ps(value, value);
+    let pair = _mm_add_ps(value, high);
+    let shuffled = _mm_shuffle_ps(pair, pair, 0x55);
+    _mm_cvtss_f32(_mm_add_ss(pair, shuffled))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn forward_step_sse2(
+    f: &mut [f32; 50],
+    d: &[f32; 50],
+    e_seg: &[f32],
+    b: &mut f32,
+    f2f: f32,
+    p_repeat_end: f32,
+    b2b: f32,
+    f_sum_prev: f32,
+) -> f32 {
+    let old_b = *b;
+    let vf2f = _mm_set1_ps(f2f);
+    let vb = _mm_set1_ps(old_b);
+    let mut total = 0.0;
+    for offset in (0..48).step_by(4) {
+        let value = _mm_loadu_ps(f.as_ptr().add(offset));
+        let repeat = _mm_loadu_ps(d.as_ptr().add(offset));
+        let emission = _mm_loadu_ps(e_seg.as_ptr().add(offset));
+        let next = _mm_mul_ps(
+            _mm_add_ps(_mm_mul_ps(value, vf2f), _mm_mul_ps(vb, repeat)),
+            emission,
+        );
+        _mm_storeu_ps(f.as_mut_ptr().add(offset), next);
+        total += hsum_sse2(next);
+    }
+    for offset in 48..50 {
+        f[offset] = (f[offset] * f2f + old_b * d[offset]) * e_seg[offset];
+        total += f[offset];
+    }
+    *b = old_b * b2b + f_sum_prev * p_repeat_end;
+    total
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn backward_step_sse2(
+    f: &mut [f32; 50],
+    d: &[f32; 50],
+    e_seg: &[f32],
+    b: &mut f32,
+    f2f: f32,
+    p_repeat_end: f32,
+    b2b: f32,
+) {
+    let vf2f = _mm_set1_ps(f2f);
+    let constant = _mm_set1_ps(p_repeat_end * *b);
+    let mut total = 0.0;
+    for offset in (0..48).step_by(4) {
+        let value = _mm_mul_ps(
+            _mm_loadu_ps(f.as_ptr().add(offset)),
+            _mm_loadu_ps(e_seg.as_ptr().add(offset)),
+        );
+        total += hsum_sse2(_mm_mul_ps(value, _mm_loadu_ps(d.as_ptr().add(offset))));
+        _mm_storeu_ps(
+            f.as_mut_ptr().add(offset),
+            _mm_add_ps(_mm_mul_ps(value, vf2f), constant),
+        );
+    }
+    for offset in 48..50 {
+        let value = f[offset] * e_seg[offset];
+        total += value * d[offset];
+        f[offset] = value * f2f + p_repeat_end * *b;
+    }
+    *b = b2b * *b + total;
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn scale_sse2(f: &mut [f32; 50], scale: f32) {
+    let scale = _mm_set1_ps(scale);
+    for offset in (0..48).step_by(4) {
+        _mm_storeu_ps(
+            f.as_mut_ptr().add(offset),
+            _mm_mul_ps(_mm_loadu_ps(f.as_ptr().add(offset)), scale),
+        );
+    }
+    f[48] *= _mm_cvtss_f32(scale);
+    f[49] *= _mm_cvtss_f32(scale);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn sum_sse2(f: &[f32; 50]) -> f32 {
+    let mut total = _mm_setzero_ps();
+    for offset in (0..48).step_by(4) {
+        total = _mm_add_ps(total, _mm_loadu_ps(f.as_ptr().add(offset)));
+    }
+    hsum_sse2(total) + f[48] + f[49]
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -217,15 +329,10 @@ pub unsafe fn forward_step_simd(
         let vf = vld1q_f32(f.as_ptr().add(off));
         let vd = vld1q_f32(d.as_ptr().add(off));
         let ve = vld1q_f32(e_seg.as_ptr().add(off));
-        let tmp = vaddq_f32(vmulq_f32(vf, vf2f), vmulq_f32(vb_old, vd));
+        let tmp = vfmaq_f32(vmulq_f32(vb_old, vd), vf, vf2f);
         let next = vmulq_f32(tmp, ve);
         vst1q_f32(f.as_mut_ptr().add(off), next);
-        let mut lanes = [0.0f32; 4];
-        vst1q_f32(lanes.as_mut_ptr(), next);
-        total += lanes[0];
-        total += lanes[1];
-        total += lanes[2];
-        total += lanes[3];
+        total += vaddvq_f32(next);
     }
     for off in 48..50 {
         f[off] = (f[off] * f2f + b_old * d[off]) * e_seg[off];
@@ -257,13 +364,8 @@ pub unsafe fn backward_step_simd(
         let vd = vld1q_f32(d.as_ptr().add(off));
         let vf_e = vmulq_f32(vf, ve);
         let weighted = vmulq_f32(vf_e, vd);
-        let mut lanes = [0.0f32; 4];
-        vst1q_f32(lanes.as_mut_ptr(), weighted);
-        total += lanes[0];
-        total += lanes[1];
-        total += lanes[2];
-        total += lanes[3];
-        let next = vaddq_f32(vmulq_f32(vf_e, vf2f), vc);
+        total += vaddvq_f32(weighted);
+        let next = vfmaq_f32(vc, vf_e, vf2f);
         vst1q_f32(f.as_mut_ptr().add(off), next);
     }
     for off in 48..50 {
@@ -293,17 +395,12 @@ pub unsafe fn scale_simd(f: &mut [f32; 50], s: f32) {
 pub unsafe fn sum_simd(f: &[f32; 50]) -> f32 {
     use std::arch::aarch64::*;
 
-    let mut total = 0.0f32;
+    let mut acc = vdupq_n_f32(0.0);
     for off in (0..48).step_by(4) {
         let values = vld1q_f32(f.as_ptr().add(off));
-        let mut lanes = [0.0f32; 4];
-        vst1q_f32(lanes.as_mut_ptr(), values);
-        total += lanes[0];
-        total += lanes[1];
-        total += lanes[2];
-        total += lanes[3];
+        acc = vaddq_f32(acc, values);
     }
-    total + f[48] + f[49]
+    vaddvq_f32(acc) + f[48] + f[49]
 }
 
 #[cfg(all(test, target_arch = "aarch64"))]
@@ -324,6 +421,15 @@ mod neon_tests {
 
     #[test]
     fn neon_forward_backward_scale_and_sum_match_scalar() {
+        let close = |left: f32, right: f32| {
+            let tolerance = 8.0 * f32::EPSILON * left.abs().max(right.abs()).max(1.0);
+            assert!((left - right).abs() <= tolerance, "{left} != {right}");
+        };
+        let arrays_close = |left: &[f32], right: &[f32]| {
+            for (&left, &right) in left.iter().zip(right) {
+                close(left, right);
+            }
+        };
         let (mut f, d, e) = inputs();
         let mut expected = f;
         let mut b = 0.73f32;
@@ -342,9 +448,9 @@ mod neon_tests {
         let sum = unsafe {
             forward_step_simd(&mut f, &d, &e, &mut b, f2f, repeat_end, b2b, previous_sum)
         };
-        assert_eq!(f, expected);
-        assert_eq!(b, expected_b);
-        assert_eq!(sum, expected_sum);
+        arrays_close(&f, &expected);
+        close(b, expected_b);
+        close(sum, expected_sum);
 
         let old_b = b;
         let mut expected_total = 0.0;
@@ -355,13 +461,13 @@ mod neon_tests {
         }
         expected_b = b2b * old_b + expected_total;
         unsafe { backward_step_simd(&mut f, &d, &e, &mut b, f2f, repeat_end, b2b) };
-        assert_eq!(f, expected);
-        assert_eq!(b, expected_b);
+        arrays_close(&f, &expected);
+        close(b, expected_b);
 
         let factor = 1.37f32;
         expected.iter_mut().for_each(|value| *value *= factor);
         unsafe { scale_simd(&mut f, factor) };
-        assert_eq!(f, expected);
-        assert_eq!(unsafe { sum_simd(&f) }, f.iter().sum::<f32>());
+        arrays_close(&f, &expected);
+        close(unsafe { sum_simd(&f) }, f.iter().sum::<f32>());
     }
 }

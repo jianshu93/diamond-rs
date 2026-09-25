@@ -35,6 +35,27 @@ const FP_LEN: usize = FP_BEFORE + FP_AFTER;
 /// up to ~16 near sequence boundaries and silently dropped hits C++ keeps.
 #[inline]
 fn fingerprint_match(query: &[Letter], target: &[Letter], q_pos: usize, r_pos: usize) -> u32 {
+    if q_pos >= FP_BEFORE
+        && r_pos >= FP_BEFORE
+        && q_pos + FP_AFTER <= query.len()
+        && r_pos + FP_AFTER <= target.len()
+    {
+        let q = &query[q_pos - FP_BEFORE..q_pos + FP_AFTER];
+        let t = &target[r_pos - FP_BEFORE..r_pos + FP_AFTER];
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            return fingerprint_match_neon(q, t);
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") {
+                unsafe { return fingerprint_match_avx2(q, t) }
+            }
+            if is_x86_feature_detected!("sse2") {
+                unsafe { return fingerprint_match_sse2(q, t) }
+            }
+        }
+    }
     let mut count = 0u32;
     let qlen = query.len() as isize;
     let tlen = target.len() as isize;
@@ -55,6 +76,52 @@ fn fingerprint_match(query: &[Letter], target: &[Letter], q_pos: usize, r_pos: u
         if (query[q_idx as usize] & LETTER_MASK) == (target[r_idx as usize] & LETTER_MASK) {
             count += 1;
         }
+    }
+    count
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn fingerprint_match_neon(query: &[Letter], target: &[Letter]) -> u32 {
+    use std::arch::aarch64::*;
+    let mask = vdupq_n_u8(LETTER_MASK as u8);
+    let mut count = 0u32;
+    for offset in (0..FP_LEN).step_by(16) {
+        let q = vandq_u8(vld1q_u8(query.as_ptr().add(offset).cast()), mask);
+        let t = vandq_u8(vld1q_u8(target.as_ptr().add(offset).cast()), mask);
+        count += vaddvq_u8(vshrq_n_u8(vceqq_u8(q, t), 7)) as u32;
+    }
+    count
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn fingerprint_match_avx2(query: &[Letter], target: &[Letter]) -> u32 {
+    use std::arch::x86_64::*;
+    let mask = _mm256_set1_epi8(LETTER_MASK);
+    let q0 = _mm256_and_si256(_mm256_loadu_si256(query.as_ptr().cast()), mask);
+    let t0 = _mm256_and_si256(_mm256_loadu_si256(target.as_ptr().cast()), mask);
+    let first = _mm256_movemask_epi8(_mm256_cmpeq_epi8(q0, t0)) as u32;
+    let q1 = _mm_loadu_si128(query.as_ptr().add(32).cast());
+    let t1 = _mm_loadu_si128(target.as_ptr().add(32).cast());
+    let mask128 = _mm_set1_epi8(LETTER_MASK);
+    let last = _mm_movemask_epi8(_mm_cmpeq_epi8(
+        _mm_and_si128(q1, mask128),
+        _mm_and_si128(t1, mask128),
+    )) as u32;
+    first.count_ones() + last.count_ones()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn fingerprint_match_sse2(query: &[Letter], target: &[Letter]) -> u32 {
+    use std::arch::x86_64::*;
+    let mask = _mm_set1_epi8(LETTER_MASK);
+    let mut count = 0;
+    for offset in (0..FP_LEN).step_by(16) {
+        let q = _mm_and_si128(_mm_loadu_si128(query.as_ptr().add(offset).cast()), mask);
+        let t = _mm_and_si128(_mm_loadu_si128(target.as_ptr().add(offset).cast()), mask);
+        count += (_mm_movemask_epi8(_mm_cmpeq_epi8(q, t)) as u32).count_ones();
     }
     count
 }
